@@ -17,6 +17,10 @@ import time
 from pathlib import Path
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
 
+
+class NotAVideo (Exception):
+    pass
+
 class QuizVideoLinkReplacer():
 
     def __init__(self, args, temp_dir):
@@ -26,6 +30,7 @@ class QuizVideoLinkReplacer():
         self.ms_email = args.ms_email
         self.headless = args.headless
         self.thumbnail_width = args.thumbnail_width
+        self.question_name = args.question_name
         self.temp_dir = temp_dir
         self.page = None
 
@@ -98,7 +103,6 @@ class QuizVideoLinkReplacer():
         
         # Wait for login to complete
         page.wait_for_load_state('networkidle')
-        time.sleep(1)
         print("Successfully logged in!")
 
 
@@ -109,18 +113,34 @@ class QuizVideoLinkReplacer():
         self.click_questions_link()
  
         questions = self.get_description_questions()
-        
+
         if not questions:
             print("No description questions found!")
             return
-        
+
+        # Filter to specific question if question_name is provided
+        if self.question_name:
+            filtered_questions = []
+            for question in questions:
+                q_name = question.locator('.questionname').inner_text()
+                if q_name == self.question_name:
+                    filtered_questions.append(question)
+                    break
+
+            if not filtered_questions:
+                print(f"Question '{self.question_name}' not found!")
+                return
+
+            questions = filtered_questions
+            print(f"Filtering to process only question: {self.question_name}")
+
         # Process each question
 
         for i, question in enumerate(questions, 1):
             print(f"\n{'='*60}")
             print(f"Question {i}/{len(questions)}")
             print(f"{'='*60}")
-            
+
             is_first_question = (i == 1)
             
             try:
@@ -129,10 +149,10 @@ class QuizVideoLinkReplacer():
                 print(f"Error processing question: {e}")
                 print("Continuing with next question...")
                 
-                # Navigate back to questions page
-                self.click_questions_link()
-                # Re-get questions list as DOM might have changed
-                questions = self.get_description_questions()
+            # Navigate back to questions page
+            self.click_questions_link()
+            # Re-get questions list as DOM might have changed
+            questions = self.get_description_questions()
         
         print("\n" + "="*60)
         print("All questions processed successfully!")
@@ -204,28 +224,30 @@ class QuizVideoLinkReplacer():
 
 
     def find_video_links_in_editor(self) -> list:
-        """Find all video links in the TinyMCE editor."""
+        """Find all video links in the TinyMCE editor (including those with existing thumbnails)."""
         print("  Finding video links in question content...")
-        
+
         # Wait for TinyMCE editor to load
         self.page.wait_for_selector('.tox-tinymce', timeout=10000)
-        
+
         # Get the editor iframe
         editor_frame = self.page.frame_locator('iframe[id^="id_questiontext_"]')
-        
+
         # Find all links that match the pattern
         links = editor_frame.locator('a[href*="/mod/url/view.php"]').all()
 
-        # Use a set to deduplicate URLs (after inserting thumbnails, same URL appears multiple times)
-        video_urls_set = set()
+        # Collect all unique URLs in document order
+        seen_urls = set()
+        urls_in_order = []
+
         for link in links:
             href = link.get_attribute('href')
-            if href:
-                video_urls_set.add(href)
+            if href and href not in seen_urls:
+                seen_urls.add(href)
+                urls_in_order.append(href)
 
-        video_urls = list(video_urls_set)
-        print(f"  Found {len(video_urls)} unique video link(s)")
-        return video_urls
+        print(f"  Found {len(urls_in_order)} unique video link(s)")
+        return urls_in_order
 
 
     def download_video_thumbnail(self, video_url: str, first_video: bool = False) -> Path:
@@ -233,19 +255,21 @@ class QuizVideoLinkReplacer():
         Navigate to the video URL, extract thumbnail, and save it.
         Returns the path to the saved thumbnail.
         """
-        print(f"  Processing video: {video_url}")
+        print(f"  Processing link: {video_url}")
         
         # Open video URL in new tab
         context = self.page.context
         video_page = context.new_page()
         
         try:
-            video_page.goto(video_url, wait_until='networkidle', timeout=30000)
-            
-            # Wait for the page to load and redirect to SharePoint
+            # Use 'load' instead of 'networkidle' for SharePoint/Stream pages
+            # These pages have constant network activity (video streams, analytics, etc.)
+            video_page.goto(video_url, wait_until='load', timeout=30000)
+
+            # Brief wait for potential redirects to SharePoint
             time.sleep(1)
             
-            # Handle Microsoft authentication if this is the first video
+            # Handle Microsoft authentication if this is the first URL.
             if first_video:
                 print("  Handling Microsoft authentication...")
                 
@@ -258,15 +282,15 @@ class QuizVideoLinkReplacer():
                         if name_input.count() > 0:
                             name_input.fill(self.ms_email)
                             video_page.click('input[type="submit"], button[type="submit"]')
-                            time.sleep(2)
-                        
+                            video_page.wait_for_load_state('load')
+
                         # Fill in password
                         print("  Filling in password...")
                         password_input = video_page.locator('input[type="password"], input[name="passwd"]')
                         if password_input.count() > 0:
                             password_input.fill(self.password)
                             video_page.click('input[type="submit"], button[type="submit"]')
-                            time.sleep(2)
+                            video_page.wait_for_load_state('load')
                         
                         # Handle MFA - wait for user to approve
                         print("\n" + "="*60)
@@ -280,14 +304,13 @@ class QuizVideoLinkReplacer():
                             # Wait for the "Stay signed in?" page to appear with the title text
                             video_page.wait_for_selector('text=Stay signed in?', timeout=60000)
                             print("  'Stay signed in?' prompt appeared")
-                            time.sleep(1)
 
                             # The Yes button has id="idSIButton9" on the Stay signed in page
                             yes_button = video_page.locator('#idSIButton9[value="Yes"]')
                             if yes_button.count() > 0 and yes_button.is_visible():
                                 print("  Found 'Yes' button, clicking to stay signed in...")
                                 yes_button.click()
-                                time.sleep(2)
+                                video_page.wait_for_load_state('load')
                             else:
                                 # Fallback to other selectors
                                 yes_selectors = [
@@ -301,14 +324,14 @@ class QuizVideoLinkReplacer():
                                     if yes_btn.count() > 0 and yes_btn.is_visible():
                                         print(f"  Found 'Yes' button with selector: {selector}")
                                         yes_btn.first.click()
-                                        time.sleep(2)
+                                        video_page.wait_for_load_state('load')
                                         break
 
                         except Exception as e:
                             print(f"  No 'Stay signed in' prompt appeared within 60 seconds (this is OK): {e}")
 
                         # Wait for redirect to SharePoint
-                        video_page.wait_for_load_state('networkidle', timeout=15000)
+                        video_page.wait_for_load_state('load', timeout=10000)
                         print("  Microsoft authentication completed!")
                         
                     except Exception as e:
@@ -319,147 +342,59 @@ class QuizVideoLinkReplacer():
             current_url = video_page.url
             if 'stream.aspx' not in current_url:
                 print(f"  Skipping - not a video link (URL: {current_url})")
-                raise Exception(f"Not a video link - URL does not contain 'stream.aspx': {current_url}")
+                raise NotAVideo(f"Not a video link - URL does not contain 'stream.aspx': {current_url}")
 
             print("  Confirmed video link (stream.aspx found)")
 
-            # Wait for video player to load
-            time.sleep(3)
-            
-            # Check if Video settings panel is visible
+            # Wait for and click Video settings button
             print("  Opening Video settings panel...")
             try:
-                # Try to click "Video settings" button if it exists
-                # Look for the button by aria-label
                 video_settings_button = video_page.locator('button[aria-label="Video settings"]')
-                if video_settings_button.count() > 0:
-                    print("  Found Video settings button, clicking...")
-                    video_settings_button.click()
-                    time.sleep(1)
-                else:
-                    print("  Video settings button not found, may already be open")
+                video_settings_button.wait_for(state='visible', timeout=10000)
+                print("  Found Video settings button, clicking...")
+                video_settings_button.click()
             except Exception as e:
                 print(f"  Could not click Video settings: {e}")
                 print("  Panel might already be open or have different structure")
-            
+
             # Click the Thumbnail option
             print("  Clicking Thumbnail option...")
-            thumbnail_clicked = False
-            
-            # Look for the thumbnail button by aria-label
             thumbnail_button = video_page.locator('button[aria-label="Thumbnail"]')
-            if thumbnail_button.count() > 0:
-                print("  Found Thumbnail button by aria-label...")
-                thumbnail_button.first.click()
-                time.sleep(1)
-                thumbnail_clicked = True
+            thumbnail_button.wait_for(state='visible', timeout=5000)
+            print("  Found Thumbnail button by aria-label...")
+            thumbnail_button.first.click()
 
-            
-            if not thumbnail_clicked:
-                raise Exception("Could not click Thumbnail option")
-            
-            # Wait for thumbnail image to appear
+            # Wait for thumbnail image to appear and get it
             print("  Waiting for thumbnail to load...")
-            time.sleep(1)
-            
-            # The thumbnail is displayed in the main page within #CollapsibleCustomOptions
-            # Look for: <img src="blob:https://ucliveac.sharepoint.com/..." class="ms-Image-image ...">
-            thumbnail_img = None
+            blob_img = video_page.locator('#CollapsibleCustomOptions img[src^="blob:"]').first
+            blob_img.wait_for(state='visible', timeout=5000)
 
-            # First, try looking in the main page within CollapsibleCustomOptions
-            print("  Looking for thumbnail in CollapsibleCustomOptions...")
-            try:
-                # Get the first blob image - it's the thumbnail
-                blob_img = video_page.locator('#CollapsibleCustomOptions img[src^="blob:"]').first
-                if blob_img.count() > 0:
-                    blob_url = blob_img.get_attribute('src')
-                    print(f"  Found blob thumbnail: {blob_url[:60] if blob_url else 'N/A'}...")
+            if blob_img.count() == 0:
+                raise Exception("Could not find blob thumbnail in CollapsibleCustomOptions")
 
-                    # Download the blob data at full resolution using JavaScript
-                    # This fetches the actual image file at its intrinsic size
-                    timestamp = int(time.time() * 1000)
-                    thumbnail_path = self.temp_dir / f"thumbnail_{timestamp}.png"
+            blob_url = blob_img.get_attribute('src')
+            print(f"  Found blob thumbnail: {blob_url[:60] if blob_url else 'N/A'}...")
 
-                    print("  Fetching blob data at full resolution...")
-                    image_data = video_page.evaluate('''async (blobUrl) => {
-                        const response = await fetch(blobUrl);
-                        const blob = await response.blob();
-                        return new Promise((resolve) => {
-                            const reader = new FileReader();
-                            reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                            reader.readAsDataURL(blob);
-                        });
-                    }''', blob_url)
-
-                    # Decode base64 and save to file
-                    with open(thumbnail_path, 'wb') as f:
-                        f.write(base64.b64decode(image_data))
-
-                    print(f"  Saved full-resolution thumbnail to {thumbnail_path}")
-                    return thumbnail_path
-
-            except Exception as e:
-                print(f"  Error downloading blob thumbnail: {e}")
-
-            # If not found in CollapsibleCustomOptions, try main page as fallback
-            if not thumbnail_img:
-                print("  Thumbnail not found in CollapsibleCustomOptions, checking main page...")
-                try:
-                    # Try different selectors for the thumbnail on main page
-                    selectors = [
-                        'img[src*="thumbnail"]',
-                        'img[alt*="Thumbnail"]',
-                        'img.ms-Image',
-                        'img[role="presentation"]'
-                    ]
-                    
-                    for selector in selectors:
-                        imgs = video_page.locator(selector).all()
-                        if len(imgs) > 0:
-                            # Get the largest image (likely the thumbnail)
-                            for img in imgs:
-                                src = img.get_attribute('src')
-                                if src and ('thumbnail' in src.lower() or 'poster' in src.lower()):
-                                    box = img.bounding_box()
-                                    if box and box['width'] > 100 and box['height'] > 100:
-                                        thumbnail_img = img
-                                        break
-                            if thumbnail_img:
-                                break
-                except Exception as e:
-                    print(f"  Error finding thumbnail on main page: {e}")
-                
-                # If we still don't have it, just take the first sizable image
-                if not thumbnail_img:
-                    try:
-                        all_imgs = video_page.locator('img').all()
-                        for img in all_imgs:
-                            box = img.bounding_box()
-                            if box and box['width'] > 100 and box['height'] > 100:
-                                thumbnail_img = img
-                                break
-                    except Exception as e:
-                        print(f"  Error finding thumbnail image: {e}")
-            
-            if not thumbnail_img:
-                print("  Warning: Could not find thumbnail image, attempting screenshot of video area")
-                # Take a screenshot of the video player area as fallback
-                video_player = video_page.locator('[data-test-id="video-player-container"]').first
-                if video_player.count() > 0:
-                    timestamp = int(time.time() * 1000)
-                    thumbnail_path = self.temp_dir / f"thumbnail_{timestamp}.png"
-                    video_player.screenshot(path=str(thumbnail_path))
-                    print(f"  Saved screenshot to {thumbnail_path}")
-                    return thumbnail_path
-                else:
-                    raise Exception("Could not find video player for screenshot")
-            
-            # Screenshot the thumbnail
+            # Download the blob data at full resolution using JavaScript
             timestamp = int(time.time() * 1000)
             thumbnail_path = self.temp_dir / f"thumbnail_{timestamp}.png"
-            thumbnail_img.screenshot(path=str(thumbnail_path))
-            print(f"  Saved thumbnail to {thumbnail_path}")
-            
+
+            print("  Fetching blob data at full resolution...")
+            image_data = video_page.evaluate('''async (blobUrl) => {
+                const response = await fetch(blobUrl);
+                const blob = await response.blob();
+                return new Promise((resolve) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                    reader.readAsDataURL(blob);
+                });
+            }''', blob_url)
+
+            # Decode base64 and save to file
+            with open(thumbnail_path, 'wb') as f:
+                f.write(base64.b64decode(image_data))
+
+            print(f"  Saved full-resolution thumbnail to {thumbnail_path}")
             return thumbnail_path
             
         finally:
@@ -468,7 +403,6 @@ class QuizVideoLinkReplacer():
 
     def replace_link_with_thumbnail(self, video_url: str, thumbnail_path: Path):
         """Insert a clickable thumbnail after the video link in the TinyMCE editor."""
-        print(f"  Inserting thumbnail after link (width: {self.thumbnail_width}px)...")
         
         # Get the editor iframe
         editor_frame = self.page.frame_locator('iframe[id^="id_questiontext_"]')
@@ -488,20 +422,14 @@ class QuizVideoLinkReplacer():
         
         # Wait for the image dialog to appear
         self.page.wait_for_selector('text=Insert image', timeout=5000)
-        time.sleep(1)
-        
+
         # Set the file to upload directly without clicking anything
         # Find the file input element (it's there even if hidden)
         print("  Selecting file to upload...")
         file_input = self.page.locator('input[type="file"]').first
         file_input.set_input_files(str(thumbnail_path))
         
-        # Wait for upload to complete and Image details dialog to appear
-        print("  Waiting for file upload and Image details dialog...")
-        time.sleep(3)
-
-        # The Image details dialog should now be visible
-        # Wait for the modal dialog to appear
+        # Wait for the modal Image details dialog to appear
         try:
             # Wait for the modal dialog with title "Image details"
             self.page.wait_for_selector('.modal-dialog:has(.modal-title:has-text("Image details"))', timeout=10000)
@@ -524,55 +452,46 @@ class QuizVideoLinkReplacer():
             # Set custom size
             print(f"  Setting custom size: {self.thumbnail_width}px width...")
 
-            # Click the "Custom size" radio button
-            custom_size_radio = self.page.locator('input.tiny_image_sizecustom, #_tiny_image_sizecustom').first
-            custom_size_radio.click()
-            time.sleep(0.3)
+            # Try Moodle 5 approach first (Custom button with class image-custom-size-toggle)
+            custom_button = self.page.locator('button.image-custom-size-toggle').first
+            if custom_button.count() > 0:
+                print("  Using Moodle 5 Custom button...")
+                custom_button.click()
+            else:
+                # Fall back to Moodle 4 approach (Custom size radio button + Keep proportion)
+                print("  Using Moodle 4 Custom size radio button...")
+                custom_size_radio = self.page.locator('input.tiny_image_sizecustom, #_tiny_image_sizecustom').first
+                custom_size_radio.click()
 
-            # Check "Keep proportion" checkbox
-            keep_proportion = self.page.locator('input.tiny_image_constrain, #_tiny_image_constrain').first
-            if not keep_proportion.is_checked():
-                keep_proportion.check()
+                # Check "Keep proportion" checkbox (Moodle 4 only)
+                keep_proportion = self.page.locator('input.tiny_image_constrain, #_tiny_image_constrain').first
+                if not keep_proportion.is_checked():
+                    keep_proportion.check()
 
-            # Set the width
+            # Set the width (same for both Moodle 4 and 5)
             width_input = self.page.locator('input.tiny_image_widthentry, #_tiny_image_widthentry').first
             width_input.fill(str(self.thumbnail_width))
-            print(f"  Custom size set to {self.thumbnail_width}px width with proportions kept")
+            print(f"  Custom size set to {self.thumbnail_width}px width")
 
             # Click the Save button
-            time.sleep(0.5)
-
-            # Look for the Save button - it has class tiny_image_urlentrysubmit
             submit_clicked = False
-            submit_selectors = [
-                'button.tiny_image_urlentrysubmit',
-                'button.btn-primary[type="submit"]',
-                'button:has-text("Save")',
-                '.modal-footer button[type="submit"]'
-            ]
+            submit_selector = 'button.tiny_image_urlentrysubmit'
 
-            for selector in submit_selectors:
-                try:
-                    btn = self.page.locator(selector).first
-                    if btn.count() > 0 and btn.is_visible():
-                        print(f"  Clicking Save button: {selector}")
-                        btn.click()
-                        time.sleep(2)
-                        submit_clicked = True
-                        break
-                except:
-                    continue
+            try:
+                btn = self.page.locator(submit_selector).first
+                if btn.count() > 0 and btn.is_visible():
+                    print(f"  Clicking Save button: {submit_selector}")
+                    btn.click()
+                    submit_clicked = True
+            except:
+                pass
 
             if not submit_clicked:
-                print("  Warning: Could not find Save button, trying Enter key...")
-                self.page.keyboard.press('Enter')
-                time.sleep(2)
+                print("  Warning: Could not find Save button")
 
         except Exception as e:
             print(f"  Error: Image details dialog did not appear: {e}")
             print("  This might cause issues with image insertion")
-            # Don't try to click anything else - just wait and hope it works
-            time.sleep(2)
 
         # Wait for the modal to close and image to be inserted
         print("  Waiting for modal to close and image to be inserted...")
@@ -580,7 +499,6 @@ class QuizVideoLinkReplacer():
             self.page.wait_for_selector('.modal-dialog', state='hidden', timeout=5000)
         except:
             pass
-        time.sleep(1)
 
         # Now we need to make the image clickable by wrapping it in a link
         # Use TinyMCE JavaScript API for reliable editing
@@ -617,6 +535,19 @@ class QuizVideoLinkReplacer():
 
             print("  Got HTML content from TinyMCE")
 
+            # Remove any existing thumbnail links for this video URL
+            # Pattern matches thumbnail links specifically (start with <span>, not text)
+            # This avoids matching text links like <a href="URL">Link text</a>
+            escaped_url = re.escape(video_url)
+            existing_thumbnail_pattern = r'<br>\s*<a[^>]*href="' + escaped_url + r'"[^>]*>\s*<span[^>]*>.*?</span>\s*</a>\s*<br>|<a[^>]*href="' + escaped_url + r'"[^>]*>\s*<span[^>]*>.*?</span>\s*</a>'
+
+            old_count = len(html_content)
+            html_content = re.sub(existing_thumbnail_pattern, '', html_content, flags=re.DOTALL)
+            new_count = len(html_content)
+
+            if old_count != new_count:
+                print("  Removed existing thumbnail for this video")
+
             # Find the new image tag we just inserted
             img_pattern = r'<img[^>]*src="[^"]*' + re.escape(thumbnail_path.name) + r'"[^>]*>'
             img_matches = list(re.finditer(img_pattern, html_content))
@@ -628,12 +559,15 @@ class QuizVideoLinkReplacer():
             link_matches = list(re.finditer(link_pattern, html_content, re.DOTALL))
 
             if img_matches and link_matches:
-                # Get the last image (most recently inserted)
-                last_img_match = img_matches[-1]
-                img_tag = last_img_match.group(0)
+                # Get one copy of the image tag (they should all be identical)
+                img_tag = img_matches[0].group(0)
 
-                # First, remove the standalone image
-                html_without_standalone_img = html_content[:last_img_match.start()] + html_content[last_img_match.end():]
+                # Remove ALL standalone instances of this image (in case of duplicates from upload glitches)
+                # This prevents multiple thumbnails appearing with only one play button
+                html_without_standalone_img = re.sub(img_pattern, '', html_content)
+
+                if len(img_matches) > 1:
+                    print(f"  Warning: Found {len(img_matches)} copies of uploaded image, removed all duplicates")
 
                 # Find the link again in the modified HTML (indices have changed)
                 link_match_new = re.search(link_pattern, html_without_standalone_img, re.DOTALL)
@@ -646,8 +580,10 @@ class QuizVideoLinkReplacer():
                     search_start = link_match_new.end()
                     sentence_end_match = re.search(sentence_end_pattern, html_without_standalone_img[search_start:])
 
-                    # Create the wrapped image with line breaks and security attributes
-                    wrapped_img = f'<br><a href="{video_url}" target="_blank" rel="noopener">{img_tag}</a><br>'
+                    # Create the wrapped image with line breaks, security attributes, and play icon overlay
+                    # Use SVG data URI for play button to avoid CSS sanitization issues
+                    play_icon = '<img src="data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 64 64\'%3E%3Ccircle cx=\'32\' cy=\'32\' r=\'32\' fill=\'rgba(0,0,0,0.6)\'/%3E%3Cpath d=\'M 26 20 L 26 44 L 44 32 Z\' fill=\'white\'/%3E%3C/svg%3E" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:64px;height:64px;pointer-events:none;" alt="">'
+                    wrapped_img = f'<br><a href="{video_url}" target="_blank" rel="noopener" style="text-decoration:none;"><span style="position:relative;display:inline-block;">{img_tag}{play_icon}</span></a><br>'
 
                     if sentence_end_match:
                         # Found the period - insert after it
@@ -676,16 +612,24 @@ class QuizVideoLinkReplacer():
                 }}''')
 
                 print(f"  Replaced old link with clickable thumbnail in HTML")
-                time.sleep(0.5)
-
                 print("  Successfully replaced link with clickable thumbnail!")
             elif img_matches and not link_matches:
                 # No link found, just wrap the image
                 print("  Warning: Could not find old link, will just add image with link")
-                last_img_match = img_matches[-1]
-                img_tag = last_img_match.group(0)
-                wrapped_img = f'<a href="{video_url}" target="_blank" rel="noopener">{img_tag}</a>'
-                new_html = html_content[:last_img_match.start()] + wrapped_img + html_content[last_img_match.end():]
+                img_tag = img_matches[0].group(0)
+
+                # Remove ALL instances of this image
+                new_html = re.sub(img_pattern, '', html_content)
+
+                if len(img_matches) > 1:
+                    print(f"  Warning: Found {len(img_matches)} copies of uploaded image, removed all duplicates")
+
+                # Use SVG data URI for play button to avoid CSS sanitization issues
+                play_icon = '<img src="data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 64 64\'%3E%3Ccircle cx=\'32\' cy=\'32\' r=\'32\' fill=\'rgba(0,0,0,0.6)\'/%3E%3Cpath d=\'M 26 20 L 26 44 L 44 32 Z\' fill=\'white\'/%3E%3C/svg%3E" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:64px;height:64px;pointer-events:none;" alt="">'
+                wrapped_img = f'<a href="{video_url}" target="_blank" rel="noopener" style="text-decoration:none;"><span style="position:relative;display:inline-block;">{img_tag}{play_icon}</span></a>'
+
+                # Add wrapped image at the end
+                new_html = new_html + wrapped_img
 
                 # Escape the HTML for JavaScript string
                 escaped_html = new_html.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n')
@@ -696,8 +640,6 @@ class QuizVideoLinkReplacer():
                         editor.setContent('{escaped_html}');
                     }}
                 }}''')
-
-                time.sleep(0.5)
             else:
                 print(f"  Warning: Could not find the inserted image in HTML (looking for {thumbnail_path.name})")
 
@@ -709,11 +651,10 @@ class QuizVideoLinkReplacer():
     def save_question_changes(self):
         """Save the changes to the question."""
         print("  Saving question changes...")
-        
+
         # Scroll to bottom to ensure Save button is visible
         self.page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-        time.sleep(0.5)
-        
+
         # Click Save changes button
         self.page.click('input[type="submit"][value*="Save"], button:has-text("Save changes")')
         
@@ -733,19 +674,26 @@ class QuizVideoLinkReplacer():
         print(f"  Edit URL: {edit_url}")
         
         # Navigate to edit page
-        self.page.goto(edit_url, wait_until='networkidle')
-        time.sleep(2)
+        # Use 'domcontentloaded' instead of 'networkidle' to avoid hanging on pages
+        # with embedded content (PowerPoint, videos, etc.) that keep network active
+        self.page.goto(edit_url, wait_until='domcontentloaded')
         
         # Find all video links in the editor
         video_urls = self.find_video_links_in_editor()
-        
+
         if not video_urls:
-            print("  No video links found in this question, skipping...")
+            print("  No likely video links found in this question, skipping...")
+            # Navigate back to questions page before returning
+            self.click_questions_link()
             return
-        
+
+        # Process videos in reverse order to maintain correct document order
+        # (each insertion at same position naturally reverses order)
+        video_urls.reverse()
+
         # Process each video link
         for i, video_url in enumerate(video_urls, 1):
-            print(f"\n  Processing video {i}/{len(video_urls)}...")
+            print(f"\n  Processing link {i}/{len(video_urls)}...")
             
             # First video of first question needs MS auth
             first_video = (is_first_question and i == 1)
@@ -757,8 +705,11 @@ class QuizVideoLinkReplacer():
                 # Replace link with thumbnail
                 self.replace_link_with_thumbnail(video_url, thumbnail_path)
                 
+            except NotAVideo:
+                continue
+            
             except Exception as e:
-                print(f"  Error processing video {video_url}: {e}")
+                print(f"  Error processing link {video_url}: {e}")
                 print("  Skipping this video and continuing...")
                 continue
         
@@ -776,6 +727,8 @@ def main():
     parser.add_argument('ms_email', help='Full email for Microsoft authentication')
     parser.add_argument('--thumbnail-width', type=int, default=500,
                         help='Width of thumbnail images in pixels (default: 500)')
+    parser.add_argument('--question-name', type=str, default=None,
+                        help='Process only the question with this name (default: process all questions)')
     parser.add_argument('--headless', action='store_true',
                         help='Run browser in headless mode (default: visible)')
 
