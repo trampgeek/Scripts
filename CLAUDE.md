@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repository contains `moodle_video_thumbnail_replacer.py`, a Python automation script that replaces video links in Moodle quiz description questions with clickable thumbnails extracted from SharePoint/Microsoft Stream videos.
+This repository contains `moodle_video_link_enhancer.py`, a Python automation script that replaces video links in Moodle quiz description questions with clickable thumbnails extracted from SharePoint/Microsoft Stream videos.
 
 ## Development Commands
 
@@ -24,19 +24,19 @@ playwright install chromium
 ### Running the Script
 ```bash
 # Basic usage
-python moodle_video_thumbnail_replacer.py <quiz_url> <username> <password>
+python moodle_video_link_enhancer.py <quiz_url> <username> <password>
 
 # With Microsoft authentication (if name differs from username)
-python moodle_video_thumbnail_replacer.py <quiz_url> <username> <password> --name "Full Name"
+python moodle_video_link_enhancer.py <quiz_url> <username> <password> --name "Full Name"
 
 # Custom thumbnail width (default is 250px)
-python moodle_video_thumbnail_replacer.py <quiz_url> <username> <password> --thumbnail-width 300
+python moodle_video_link_enhancer.py <quiz_url> <username> <password> --thumbnail-width 300
 
 # Headless mode
-python moodle_video_thumbnail_replacer.py <quiz_url> <username> <password> --headless
+python moodle_video_link_enhancer.py <quiz_url> <username> <password> --headless
 
 # Debug mode (pauses for manual inspection)
-python moodle_video_thumbnail_replacer.py <quiz_url> <username> <password> --debug
+python moodle_video_link_enhancer.py <quiz_url> <username> <password> --debug
 ```
 
 ## Architecture

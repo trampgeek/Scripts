@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-Moodle Quiz Video Link to Thumbnail Replacer
+Moodle Quiz Video Link Enhancer
 
-This script automates the process of replacing video links in Moodle quiz
-description questions with clickable thumbnails.
+This script automates the process of enhancing video links in Moodle quiz
+description questions by the addition of clickable thumbnails.
 
 Usage:
-    python moodle_video_thumbnail_replacer.py <quiz_url> <username> <password>
+    python moodle_video_link_enhancer.py <quiz_url> <username> <password> <ms_full_email>
+
+Optional additional parameters:
+    --thumbnail-width  Width in pixels of the inserted thumbnails
+    --question-name    Name of a specific single question to process
+    --headless         Run in a headless browser
 """
 
 import argparse
@@ -19,9 +24,10 @@ from playwright.sync_api import sync_playwright, Page, TimeoutError as Playwrigh
 
 
 class NotAVideo (Exception):
+    """Raised if a link turns out not to be a video."""
     pass
 
-class QuizVideoLinkReplacer():
+class QuizVideoLinkEnhancer():
 
     def __init__(self, args, temp_dir):
         self.quiz_url = args.quiz_url
@@ -35,7 +41,7 @@ class QuizVideoLinkReplacer():
         self.page = None
 
 
-    def replace_all_video_links(self):
+    def enhance_all_video_links(self):
         with sync_playwright() as p:
                 # Launch browser - use Chrome channel for better SharePoint/Stream support
                 # Chromium often has issues with Microsoft video DRM and codecs
@@ -109,13 +115,20 @@ class QuizVideoLinkReplacer():
     def process_quiz(self):
         """Navigate to and process the given quiz"""
         self.navigate_to_quiz()
- 
+
         self.click_questions_link()
- 
-        questions = self.get_description_questions()
+
+        # If question_name is specified, search all questions; otherwise only description questions
+        if self.question_name:
+            questions = self.get_all_questions()
+        else:
+            questions = self.get_description_questions()
 
         if not questions:
-            print("No description questions found!")
+            if self.question_name:
+                print("No questions found!")
+            else:
+                print("No description questions found!")
             return
 
         # Filter to specific question if question_name is provided
@@ -135,6 +148,8 @@ class QuizVideoLinkReplacer():
             print(f"Filtering to process only question: {self.question_name}")
 
         # Process each question
+        total_questions = len(questions)
+        modified_questions = 0
 
         for i, question in enumerate(questions, 1):
             print(f"\n{'='*60}")
@@ -142,20 +157,26 @@ class QuizVideoLinkReplacer():
             print(f"{'='*60}")
 
             is_first_question = (i == 1)
-            
+
             try:
-                self.process_question(question, is_first_question)
+                was_modified = self.process_question(question, is_first_question)
+                if was_modified:
+                    modified_questions += 1
             except Exception as e:
                 print(f"Error processing question: {e}")
                 print("Continuing with next question...")
-                
+
             # Navigate back to questions page
             self.click_questions_link()
             # Re-get questions list as DOM might have changed
-            questions = self.get_description_questions()
-        
+            # Use the same logic as initial question retrieval
+            if self.question_name:
+                questions = self.get_all_questions()
+            else:
+                questions = self.get_description_questions()
+
         print("\n" + "="*60)
-        print("All questions processed successfully!")
+        print(f"Processing complete: {total_questions} question(s) inspected, {modified_questions} modified")
         print("="*60)
 
 
@@ -208,18 +229,29 @@ class QuizVideoLinkReplacer():
     def get_description_questions(self) -> list:
         """Get all description type questions from the quiz."""
         print("Finding description questions...")
-        
+
         # Find all li elements with class qtype_description
         questions = self.page.locator('li.qtype_description').all()
         print(f"Found {len(questions)} description question(s)")
-        
+
+        return questions
+
+    def get_all_questions(self) -> list:
+        """Get all questions from the quiz (any type)."""
+        print("Finding all questions...")
+
+        # Find all li elements with class starting with qtype_
+        questions = self.page.locator('li[class*="qtype_"]').all()
+        print(f"Found {len(questions)} question(s)")
+
         return questions
 
 
     def extract_edit_link(self, question_element) -> str:
         """Extract the edit link from a question element."""
         # Find the edit link within the question
-        edit_link = question_element.locator('a[title*="Edit question"]').get_attribute('href')
+        # Use a more specific selector to avoid matching "Edit question number" links
+        edit_link = question_element.locator('a[href*="/question/bank/editquestion/question.php"]').get_attribute('href')
         return edit_link
 
 
@@ -271,72 +303,7 @@ class QuizVideoLinkReplacer():
             
             # Handle Microsoft authentication if this is the first URL.
             if first_video:
-                print("  Handling Microsoft authentication...")
-                
-                # Check if we're on Microsoft login page
-                if 'login.microsoftonline.com' in video_page.url or 'login.windows.net' in video_page.url:
-                    try:
-                        # Wait for and fill in name/email field
-                        print("  Filling in name/email...")
-                        name_input = video_page.locator('input[type="email"], input[name="loginfmt"]')
-                        if name_input.count() > 0:
-                            name_input.fill(self.ms_email)
-                            video_page.click('input[type="submit"], button[type="submit"]')
-                            video_page.wait_for_load_state('load')
-
-                        # Fill in password
-                        print("  Filling in password...")
-                        password_input = video_page.locator('input[type="password"], input[name="passwd"]')
-                        if password_input.count() > 0:
-                            password_input.fill(self.password)
-                            video_page.click('input[type="submit"], button[type="submit"]')
-                            video_page.wait_for_load_state('load')
-                        
-                        # Handle MFA - wait for user to approve
-                        print("\n" + "="*60)
-                        print("  MFA REQUIRED: Please approve the sign-in on your device")
-                        print("  Waiting for MFA approval and 'Stay signed in?' prompt...")
-                        print("="*60)
-
-                        # Handle "Stay signed in?" prompt
-                        # Wait up to 60 seconds for the page to appear (don't just sleep)
-                        try:
-                            # Wait for the "Stay signed in?" page to appear with the title text
-                            video_page.wait_for_selector('text=Stay signed in?', timeout=60000)
-                            print("  'Stay signed in?' prompt appeared")
-
-                            # The Yes button has id="idSIButton9" on the Stay signed in page
-                            yes_button = video_page.locator('#idSIButton9[value="Yes"]')
-                            if yes_button.count() > 0 and yes_button.is_visible():
-                                print("  Found 'Yes' button, clicking to stay signed in...")
-                                yes_button.click()
-                                video_page.wait_for_load_state('load')
-                            else:
-                                # Fallback to other selectors
-                                yes_selectors = [
-                                    'input[type="submit"][value="Yes"]',
-                                    'button:has-text("Yes")',
-                                    'input[value="Yes"]'
-                                ]
-
-                                for selector in yes_selectors:
-                                    yes_btn = video_page.locator(selector)
-                                    if yes_btn.count() > 0 and yes_btn.is_visible():
-                                        print(f"  Found 'Yes' button with selector: {selector}")
-                                        yes_btn.first.click()
-                                        video_page.wait_for_load_state('load')
-                                        break
-
-                        except Exception as e:
-                            print(f"  No 'Stay signed in' prompt appeared within 60 seconds (this is OK): {e}")
-
-                        # Wait for redirect to SharePoint
-                        video_page.wait_for_load_state('load', timeout=10000)
-                        print("  Microsoft authentication completed!")
-                        
-                    except Exception as e:
-                        print(f"  Warning during Microsoft authentication: {e}")
-                        print("  Attempting to continue...")
+                self.do_ms_authentication(video_page)
             
             # Check if this is actually a video link (must contain 'stream.aspx')
             current_url = video_page.url
@@ -399,6 +366,53 @@ class QuizVideoLinkReplacer():
             
         finally:
             video_page.close()
+
+
+    def do_ms_authentication(self, video_page):
+        """Grind through the MS authentication process, including the MFA step,
+           when processing the first question.
+        """
+        print("  Handling Microsoft authentication...")
+        
+        # Check if we're on Microsoft login page
+        if 'login.microsoftonline.com' in video_page.url or 'login.windows.net' in video_page.url:
+            try:
+                # Wait for and fill in name/email field
+                print("  Filling in name/email...")
+                name_input = video_page.locator('input[type="email"], input[name="loginfmt"]')
+                name_input.fill(self.ms_email)
+                video_page.click('input[type="submit"], button[type="submit"]')
+
+                # Fill in password
+                print("  Filling in password...")
+                password_input = video_page.locator('input[type="password"], input[name="passwd"]')
+                password_input.fill(self.password)
+                video_page.click('input[type="submit"], button[type="submit"]')
+                
+                # Handle MFA - wait for user to approve
+                print("\n" + "="*60)
+                print("  MFA REQUIRED: Please approve the sign-in on your device")
+                print("  Waiting for MFA approval and 'Stay signed in?' prompt...")
+                print("="*60)
+
+                # Handle "Stay signed in?" prompt
+
+                # Wait for the "Stay signed in?" page to appear with the title text
+                video_page.wait_for_selector('text=Stay signed in?', timeout=60000)
+                print("  'Stay signed in?' prompt appeared")
+
+                # The Yes button has id="idSIButton9" on the Stay signed in page
+                yes_button = video_page.locator('#idSIButton9[value="Yes"]')
+                print("  Found 'Yes' button, clicking to stay signed in...")
+                yes_button.click()
+
+                # Wait for redirect to SharePoint
+                video_page.wait_for_load_state('load', timeout=10000)
+                print("  Microsoft authentication completed!")
+                
+            except Exception as e:
+                print(f"  Warning during Microsoft authentication: {e}")
+                print("  Attempting to continue...")
 
 
     def add_thumbnail_after_link(self, video_url: str, thumbnail_path: Path):
@@ -634,64 +648,90 @@ class QuizVideoLinkReplacer():
 
         # Click Save changes button
         self.page.click('input[type="submit"][value*="Save"], button:has-text("Save changes")')
-        
+
         # Wait for save to complete
         self.page.wait_for_load_state('networkidle')
         print("  Question saved successfully!")
 
+    def cancel_question_edit(self):
+        """Cancel the edit without saving changes."""
+        print("  Cancelling edit (no changes made)...")
+
+        # Scroll to bottom to ensure Cancel button is visible
+        self.page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+
+        # Click Cancel button
+        self.page.click('a:has-text("Cancel"), button:has-text("Cancel")')
+
+        # Wait for navigation to complete
+        self.page.wait_for_load_state('networkidle')
+        print("  Edit cancelled successfully!")
+
 
     def process_question(self, question_element, is_first_question: bool = False):
-        """Process a single description question."""
+        """Process a single description question.
+        Returns True if changes were made and saved, False otherwise."""
         # Extract question name for logging
         question_name = question_element.locator('.questionname').inner_text()
         print(f"\nProcessing question: {question_name}")
-        
+
         # Get the edit link
         edit_url = self.extract_edit_link(question_element)
         print(f"  Edit URL: {edit_url}")
-        
+
         # Navigate to edit page
         # Use 'domcontentloaded' instead of 'networkidle' to avoid hanging on pages
         # with embedded content (PowerPoint, videos, etc.) that keep network active
         self.page.goto(edit_url, wait_until='domcontentloaded')
-        
+
         # Find all video links in the editor
         video_urls = self.find_video_links_in_editor()
 
         if not video_urls:
             print("  No likely video links found in this question, skipping...")
-            # Navigate back to questions page before returning
-            self.click_questions_link()
-            return
+            # Cancel the edit since we made no changes
+            self.cancel_question_edit()
+            return False
 
         # Process videos in reverse order to maintain correct document order
         # (each insertion at same position naturally reverses order)
         video_urls.reverse()
 
+        # Track whether we made any changes
+        changes_made = False
+
         # Process each video link
         for i, video_url in enumerate(video_urls, 1):
             print(f"\n  Processing link {i}/{len(video_urls)}...")
-            
+
             # First video of first question needs MS auth
             first_video = (is_first_question and i == 1)
-            
+
             try:
                 # Download thumbnail
                 thumbnail_path = self.download_video_thumbnail(video_url, first_video)
-                
+
                 # Add the thumbnail at the end of the sentence containing the video URL.
                 self.add_thumbnail_after_link(video_url, thumbnail_path)
-                
+
+                # Mark that we successfully made a change
+                changes_made = True
+
             except NotAVideo:
                 continue
-            
+
             except Exception as e:
                 print(f"  Error processing link {video_url}: {e}")
                 print("  Skipping this video and continuing...")
                 continue
-        
-        # Save the question changes
-        self.save_question_changes()
+
+        # Save or cancel based on whether changes were made
+        if changes_made:
+            self.save_question_changes()
+            return True
+        else:
+            self.cancel_question_edit()
+            return False
 
 
 def main():
@@ -702,8 +742,8 @@ def main():
     parser.add_argument('username', help='Moodle username')
     parser.add_argument('password', help='Moodle password')
     parser.add_argument('ms_email', help='Full email for Microsoft authentication')
-    parser.add_argument('--thumbnail-width', type=int, default=250,
-                        help='Width of thumbnail images in pixels (default: 250)')
+    parser.add_argument('--thumbnail-width', type=int, default=350,
+                        help='Width of thumbnail images in pixels (default: 350)')
     parser.add_argument('--question-name', type=str, default=None,
                         help='Process only the question with this name (default: process all questions)')
     parser.add_argument('--headless', action='store_true',
@@ -721,8 +761,8 @@ def main():
     print(f"Temporary directory: {temp_dir}")
     print()
     
-    replacer = QuizVideoLinkReplacer(args, temp_dir)
-    replacer.replace_all_video_links()
+    replacer = QuizVideoLinkEnhancer(args, temp_dir)
+    replacer.enhance_all_video_links()
 
 
 if __name__ == '__main__':
