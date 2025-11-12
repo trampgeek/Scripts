@@ -401,10 +401,16 @@ class QuizVideoLinkReplacer():
             video_page.close()
 
 
-    def replace_link_with_thumbnail(self, video_url: str, thumbnail_path: Path):
-        """Insert a clickable thumbnail after the video link in the TinyMCE editor."""
+    def add_thumbnail_after_link(self, video_url: str, thumbnail_path: Path):
+        """Insert a clickable thumbnail following the period at the end of the 
+           sentence containing the given video_url.
+           This is a bit tricky. We first insert the image at the end of the
+           question text using the TinyMCE "Insert image" toolbar function,
+           then switch to using the TinyMCE edit API to move the image to
+           the right place and wrap it in an <a> element.
+        """
         
-        # Get the editor iframe
+        # Get the editor iframe (NB: assuming use of TinyMCE editor).
         editor_frame = self.page.frame_locator('iframe[id^="id_questiontext_"]')
 
         # Find the link to get its text for alt text
@@ -412,16 +418,27 @@ class QuizVideoLinkReplacer():
         link_text = link.inner_text()
 
         # Don't delete anything yet - we'll do the replacement in source code mode
-        # Just click somewhere in the editor to make sure it has focus
-        print("  Inserting thumbnail image...")
-        editor_frame.locator('body').click()
+        # Click at a safe location in the editor to give it focus, ensuring we don't
+        # click on an existing image (which would cause TinyMCE to open Edit mode instead of Insert)
+        print("  Inserting the thumbnail image...")
+        # Click at the very start of the body content to avoid clicking on any images
+        editor_frame.locator('body').click(position={'x': 5, 'y': 5})
         
         # Click the Insert image button in TinyMCE toolbar
         # The button has aria-label="Image"
         self.page.click('button[aria-label="Image"]', timeout=5000)
-        
-        # Wait for the image dialog to appear
-        self.page.wait_for_selector('text=Insert image', timeout=5000)
+
+        # Wait for the "Insert image" dialog to appear
+        # If this fails, it likely means we accidentally clicked on an existing image,
+        # causing TinyMCE to open the edit dialog instead of insert dialog
+        try:
+            self.page.wait_for_selector('text=Insert image', timeout=5000)
+        except Exception as e:
+            raise Exception(
+                "Failed to open Insert image dialog. This likely means the editor focus "
+                "was on an existing image, causing TinyMCE to open Edit mode instead of Insert mode. "
+                f"Original error: {e}"
+            )
 
         # Set the file to upload directly without clicking anything
         # Find the file input element (it's there even if hidden)
@@ -435,82 +452,91 @@ class QuizVideoLinkReplacer():
             self.page.wait_for_selector('.modal-dialog:has(.modal-title:has-text("Image details"))', timeout=10000)
             print("  Image details dialog appeared")
 
-            # Find the alt text field (it's a textarea with class tiny_image_altentry)
-            alttext_field = self.page.locator('textarea.tiny_image_altentry, #_tiny_image_altentry, textarea[name="altentry"]').first
-
-            # Wait for it to be visible
-            alttext_field.wait_for(state='visible', timeout=5000)
-
-            # Create a description based on the link text
-            video_name = link_text if link_text else "video"
-            description = f"Thumbnail of {video_name}"
-
-            # Fill in the alttext field
-            alttext_field.fill(description)
-            print(f"  Set image description to: {description}")
-
-            # Set custom size
-            print(f"  Setting custom size: {self.thumbnail_width}px width...")
-
-            # Try Moodle 5 approach first (Custom button with class image-custom-size-toggle)
-            custom_button = self.page.locator('button.image-custom-size-toggle').first
-            if custom_button.count() > 0:
-                print("  Using Moodle 5 Custom button...")
-                custom_button.click()
-            else:
-                # Fall back to Moodle 4 approach (Custom size radio button + Keep proportion)
-                print("  Using Moodle 4 Custom size radio button...")
-                custom_size_radio = self.page.locator('input.tiny_image_sizecustom, #_tiny_image_sizecustom').first
-                custom_size_radio.click()
-
-                # Check "Keep proportion" checkbox (Moodle 4 only)
-                keep_proportion = self.page.locator('input.tiny_image_constrain, #_tiny_image_constrain').first
-                if not keep_proportion.is_checked():
-                    keep_proportion.check()
-
-            # Set the width (same for both Moodle 4 and 5)
-            width_input = self.page.locator('input.tiny_image_widthentry, #_tiny_image_widthentry').first
-            width_input.fill(str(self.thumbnail_width))
-            print(f"  Custom size set to {self.thumbnail_width}px width")
-
-            # Click the Save button
-            submit_clicked = False
-            submit_selector = 'button.tiny_image_urlentrysubmit'
-
-            try:
-                btn = self.page.locator(submit_selector).first
-                if btn.count() > 0 and btn.is_visible():
-                    print(f"  Clicking Save button: {submit_selector}")
-                    btn.click()
-                    submit_clicked = True
-            except:
-                pass
-
-            if not submit_clicked:
-                print("  Warning: Could not find Save button")
+            self.set_image_details_and_save(link_text)
 
         except Exception as e:
             print(f"  Error: Image details dialog did not appear: {e}")
-            print("  This might cause issues with image insertion")
 
         # Wait for the modal to close and image to be inserted
         print("  Waiting for modal to close and image to be inserted...")
-        try:
-            self.page.wait_for_selector('.modal-dialog', state='hidden', timeout=5000)
-        except:
-            pass
+        self.page.wait_for_selector('.modal-dialog', state='hidden', timeout=5000)
+
 
         # Now we need to make the image clickable by wrapping it in a link
-        # Use TinyMCE JavaScript API for reliable editing
+        self.move_image_and_wrap_in_link(video_url, thumbnail_path)
+
+
+    def set_image_details_and_save(self, link_text):
+        """Fill out the Image details dialog and save.
+           Called after Image Details modal dialog has appeared.
+        """
+        # Find the alt text field and fill it in.
+        alttext_field = self.page.locator('textarea.tiny_image_altentry, #_tiny_image_altentry, textarea[name="altentry"]').first
+        alttext_field.wait_for(state='visible', timeout=5000)
+        video_name = link_text if link_text else "video"
+        description = f"Thumbnail of {video_name}"
+        alttext_field.fill(description)
+        print(f"  Set image description to: {description}")
+
+        # Set custom size. Try Moodle 5 approach first (Custom button with class image-custom-size-toggle)
+        print(f"  Setting custom size: {self.thumbnail_width}px width...")
+        custom_button = self.page.locator('button.image-custom-size-toggle').first
+        if custom_button.count() > 0:
+            print("  Using Moodle 5 Custom button...")
+            custom_button.click()
+        else:
+            # Fall back to Moodle 4 approach (Custom size radio button + Keep proportion)
+            print("  Using Moodle 4 Custom size radio button...")
+            custom_size_radio = self.page.locator('input.tiny_image_sizecustom, #_tiny_image_sizecustom').first
+            custom_size_radio.click()
+
+            # Check "Keep proportion" checkbox.
+            keep_proportion = self.page.locator('input.tiny_image_constrain, #_tiny_image_constrain').first
+            if not keep_proportion.is_checked():
+                keep_proportion.check()
+
+        # Set the width (same for both Moodle 4 and 5)
+        width_input = self.page.locator('input.tiny_image_widthentry, #_tiny_image_widthentry').first
+        width_input.fill(str(self.thumbnail_width))
+        print(f"  Custom size set to {self.thumbnail_width}px width")
+
+        # Look for the Save button - it has class tiny_image_urlentrysubmit
+        submit_clicked = False
+        submit_selector = 'button.tiny_image_urlentrysubmit'
+
+        try:
+            btn = self.page.locator(submit_selector).first
+            print(f"  Button locator count: {btn.count()}")
+            print(f"  Button is_visible: {btn.is_visible() if btn.count() > 0 else 'N/A'}")
+            if btn.count() > 0 and btn.is_visible():
+                print(f"  Clicking Save button: {submit_selector}")
+                time.sleep(1)
+                btn.click()
+                submit_clicked = True
+                print("  Save button click completed")
+        except Exception as e:
+            print(f"  Exception clicking Save button: {e}")
+            import traceback
+            traceback.print_exc()
+
+        if not submit_clicked:
+            print("  Warning: Could not find Save button")
+
+
+    def move_image_and_wrap_in_link(self, video_url: str, thumbnail_path: Path):
+        """Use the TinyMCE edit API to edit the question text.
+           Remove any existing thumbnails with the given video_url.
+           Then locate the thumbnail we just added, wrap it in an <a> link,
+           and insert it after the first period following the first occurrence
+           of the video url.
+        """
         print("  Using TinyMCE API to wrap image with link...")
 
         try:
             # Find the TinyMCE editor instance for questiontext
-            # First, get the editor ID by finding the iframe
             editor_id = self.page.evaluate('''() => {
                 const iframe = document.querySelector('iframe[id^="id_questiontext_"]');
                 if (iframe) {
-                    // The editor ID is usually the iframe ID without the _ifr suffix
                     return iframe.id.replace('_ifr', '');
                 }
                 return null;
@@ -535,118 +561,69 @@ class QuizVideoLinkReplacer():
 
             print("  Got HTML content from TinyMCE")
 
-            # Remove any existing thumbnail links for this video URL
-            # Pattern matches thumbnail links specifically (start with <span>, not text)
-            # This avoids matching text links like <a href="URL">Link text</a>
+            # Step 1: Remove any existing wrapped_img structure for this video_url
+            # The wrapped_img structure is: (optional <br>)<a href="video_url" ...><span ...><img ...><img ...></span></a>(optional <br>)
             escaped_url = re.escape(video_url)
-            existing_thumbnail_pattern = r'<br>\s*<a[^>]*href="' + escaped_url + r'"[^>]*>\s*<span[^>]*>.*?</span>\s*</a>\s*<br>|<a[^>]*href="' + escaped_url + r'"[^>]*>\s*<span[^>]*>.*?</span>\s*</a>'
-
+            # Make both leading and trailing <br> optional, and match <a> tags that contain <span> wrappers
+            existing_thumbnail_pattern = r'(?:<br>\s*)?<a[^>]*href="' + escaped_url + r'"[^>]*>\s*<span[^>]*>.*?</span>\s*</a>\s*(?:<br>)?'
             old_count = len(html_content)
             html_content = re.sub(existing_thumbnail_pattern, '', html_content, flags=re.DOTALL)
-            new_count = len(html_content)
-
-            if old_count != new_count:
+            if old_count != len(html_content):
                 print("  Removed existing thumbnail for this video")
 
-            # Find the new image tag we just inserted
+            # Step 2: Locate and extract the <img> element with the given thumbnail path
             img_pattern = r'<img[^>]*src="[^"]*' + re.escape(thumbnail_path.name) + r'"[^>]*>'
-            img_matches = list(re.finditer(img_pattern, html_content))
+            img_match = re.search(img_pattern, html_content)
 
-            # Find the old link tag to replace
-            # Escape the URL for use in regex
-            escaped_url = re.escape(video_url)
-            link_pattern = r'<a[^>]*href="' + escaped_url + r'"[^>]*>.*?</a>'
-            link_matches = list(re.finditer(link_pattern, html_content, re.DOTALL))
-
-            if img_matches and link_matches:
-                # Get one copy of the image tag (they should all be identical)
-                img_tag = img_matches[0].group(0)
-
-                # Remove ALL standalone instances of this image (in case of duplicates from upload glitches)
-                # This prevents multiple thumbnails appearing with only one play button
-                html_without_standalone_img = re.sub(img_pattern, '', html_content)
-
-                if len(img_matches) > 1:
-                    print(f"  Warning: Found {len(img_matches)} copies of uploaded image, removed all duplicates")
-
-                # Find the link again in the modified HTML (indices have changed)
-                link_match_new = re.search(link_pattern, html_without_standalone_img, re.DOTALL)
-
-                if link_match_new:
-                    # Find the end of the sentence after the link (look for period/full-stop)
-                    # Search for a period after the link ends
-                    # Period followed by space, closing tag, or opening tag (like <br>)
-                    sentence_end_pattern = r'\.(\s|<)'
-                    search_start = link_match_new.end()
-                    sentence_end_match = re.search(sentence_end_pattern, html_without_standalone_img[search_start:])
-
-                    # Create the wrapped image with line breaks, security attributes, and play icon overlay
-                    # Use SVG data URI for play button to avoid CSS sanitization issues
-                    play_icon = '<img src="data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 64 64\'%3E%3Ccircle cx=\'32\' cy=\'32\' r=\'32\' fill=\'rgba(0,0,0,0.6)\'/%3E%3Cpath d=\'M 26 20 L 26 44 L 44 32 Z\' fill=\'white\'/%3E%3C/svg%3E" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:64px;height:64px;pointer-events:none;" alt="">'
-                    wrapped_img = f'<br><a href="{video_url}" target="_blank" rel="noopener" style="text-decoration:none;"><span style="position:relative;display:inline-block;">{img_tag}{play_icon}</span></a><br>'
-
-                    if sentence_end_match:
-                        # Found the period - insert after it
-                        insertion_point = search_start + sentence_end_match.start() + 1  # +1 to be after the period
-
-                        # Insert the thumbnail after the sentence
-                        new_html = (html_without_standalone_img[:insertion_point] +
-                                wrapped_img +
-                                html_without_standalone_img[insertion_point:])
-                    else:
-                        # No period found - insert at the very end of the question text
-                        new_html = html_without_standalone_img + wrapped_img
-                else:
-                    # Fallback: if we can't find the link, just remove the standalone image
-                    new_html = html_without_standalone_img
-
-                # Update TinyMCE editor content using JavaScript API
-                # Escape the HTML for JavaScript string
-                escaped_html = new_html.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n')
-
-                self.page.evaluate(f'''() => {{
-                    const editor = tinymce.get('{editor_id}');
-                    if (editor) {{
-                        editor.setContent('{escaped_html}');
-                    }}
-                }}''')
-
-                print(f"  Replaced old link with clickable thumbnail in HTML")
-                print("  Successfully replaced link with clickable thumbnail!")
-            elif img_matches and not link_matches:
-                # No link found, just wrap the image
-                print("  Warning: Could not find old link, will just add image with link")
-                img_tag = img_matches[0].group(0)
-
-                # Remove ALL instances of this image
-                new_html = re.sub(img_pattern, '', html_content)
-
-                if len(img_matches) > 1:
-                    print(f"  Warning: Found {len(img_matches)} copies of uploaded image, removed all duplicates")
-
-                # Use SVG data URI for play button to avoid CSS sanitization issues
-                play_icon = '<img src="data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 64 64\'%3E%3Ccircle cx=\'32\' cy=\'32\' r=\'32\' fill=\'rgba(0,0,0,0.6)\'/%3E%3Cpath d=\'M 26 20 L 26 44 L 44 32 Z\' fill=\'white\'/%3E%3C/svg%3E" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:64px;height:64px;pointer-events:none;" alt="">'
-                wrapped_img = f'<a href="{video_url}" target="_blank" rel="noopener" style="text-decoration:none;"><span style="position:relative;display:inline-block;">{img_tag}{play_icon}</span></a>'
-
-                # Add wrapped image at the end
-                new_html = new_html + wrapped_img
-
-                # Escape the HTML for JavaScript string
-                escaped_html = new_html.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n')
-
-                self.page.evaluate(f'''() => {{
-                    const editor = tinymce.get('{editor_id}');
-                    if (editor) {{
-                        editor.setContent('{escaped_html}');
-                    }}
-                }}''')
-            else:
+            if not img_match:
                 print(f"  Warning: Could not find the inserted image in HTML (looking for {thumbnail_path.name})")
+                return
+
+            img_tag = img_match.group(0)
+            # Remove the image from its current location
+            html_content = html_content[:img_match.start()] + html_content[img_match.end():]
+
+            # Step 3: Wrap it into an <a> element with play icon overlay
+            play_icon = '<img src="data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 64 64\'%3E%3Ccircle cx=\'32\' cy=\'32\' r=\'32\' fill=\'rgba(0,0,0,0.6)\'/%3E%3Cpath d=\'M 26 20 L 26 44 L 44 32 Z\' fill=\'white\'/%3E%3C/svg%3E" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:64px;height:64px;pointer-events:none;" alt="">'
+            wrapped_img = f'<br><a href="{video_url}" target="_blank" rel="noopener" style="text-decoration:none;"><span style="position:relative;display:inline-block;">{img_tag}{play_icon}</span></a><br>'
+
+            # Step 4: Insert after the first period following the first occurrence of video_url
+            url_pos = html_content.find(video_url)
+
+            if url_pos == -1:
+                # No URL found, append at the end
+                print("  Warning: Could not find video URL in HTML, appending thumbnail at end")
+                new_html = html_content + wrapped_img
+            else:
+                # Find the first period after the URL occurrence
+                period_pattern = r'\.(\s|<)'
+                period_match = re.search(period_pattern, html_content[url_pos:])
+
+                if period_match:
+                    # Insert after the period
+                    insertion_point = url_pos + period_match.start() + 1  # +1 to be after the period
+                    new_html = html_content[:insertion_point] + wrapped_img + html_content[insertion_point:]
+                else:
+                    # No period found, append at the end
+                    print("  Warning: Could not find period after video URL, appending thumbnail at end")
+                    new_html = html_content + wrapped_img
+
+            # Update TinyMCE editor content
+            escaped_html = new_html.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n')
+
+            self.page.evaluate(f'''() => {{
+                const editor = tinymce.get('{editor_id}');
+                if (editor) {{
+                    editor.setContent('{escaped_html}');
+                }}
+            }}''')
+
+            print("  Successfully replaced link with clickable thumbnail!")
 
         except Exception as e:
             print(f"  Error using TinyMCE API to wrap image: {e}")
             raise
-
+    
 
     def save_question_changes(self):
         """Save the changes to the question."""
@@ -702,8 +679,8 @@ class QuizVideoLinkReplacer():
                 # Download thumbnail
                 thumbnail_path = self.download_video_thumbnail(video_url, first_video)
                 
-                # Replace link with thumbnail
-                self.replace_link_with_thumbnail(video_url, thumbnail_path)
+                # Add the thumbnail at the end of the sentence containing the video URL.
+                self.add_thumbnail_after_link(video_url, thumbnail_path)
                 
             except NotAVideo:
                 continue
@@ -725,8 +702,8 @@ def main():
     parser.add_argument('username', help='Moodle username')
     parser.add_argument('password', help='Moodle password')
     parser.add_argument('ms_email', help='Full email for Microsoft authentication')
-    parser.add_argument('--thumbnail-width', type=int, default=500,
-                        help='Width of thumbnail images in pixels (default: 500)')
+    parser.add_argument('--thumbnail-width', type=int, default=250,
+                        help='Width of thumbnail images in pixels (default: 250)')
     parser.add_argument('--question-name', type=str, default=None,
                         help='Process only the question with this name (default: process all questions)')
     parser.add_argument('--headless', action='store_true',
