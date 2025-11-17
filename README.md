@@ -23,17 +23,12 @@ A Python script that automates replacing video links in Moodle quiz description 
 pip install -r requirements.txt
 ```
 
-2. Install Playwright browsers:
+2. Install Playwright browser:
 ```bash
-# Install Chromium (basic - may have issues with SharePoint videos)
-playwright install chromium
 
-# RECOMMENDED: Install Chrome for better SharePoint/Stream support
+# Install Chrome for SharePoint/Stream support
 playwright install chrome
 
-# OR install Edge (also works well with Microsoft services)
-playwright install msedge
-```
 
 **Important**: The script works best with Chrome or Edge browsers due to SharePoint/Microsoft Stream video codec requirements. Chromium (the open-source version) often fails to play these videos due to missing proprietary codecs and DRM support.
 
@@ -44,19 +39,19 @@ Basic usage:
 python moodle_video_link_enhancer.py <quiz_url> <username> <password>
 ```
 
-With Microsoft authentication (different name from username):
+With Microsoft authentication (different email from username):
 ```bash
-python moodle_video_link_enhancer.py <quiz_url> <username> <password> --name "Your Full Name"
+python moodle_video_link_enhancer.py <quiz_url> <username> <password> <ms-email>
 ```
 
-Custom thumbnail width (default is 250px):
+Custom thumbnail width (default is 400px):
 ```bash
-python moodle_video_link_enhancer.py <quiz_url> <username> <password> --thumbnail-width 300
+python moodle_video_link_enhancer.py <quiz_url> <username> <password>  <ms-email> --thumbnail-width 300
 ```
 
 Run in headless mode (no visible browser):
 ```bash
-python moodle_video_link_enhancer.py <quiz_url> <username> <password> --headless
+python moodle_video_link_enhancer.py <quiz_url> <username> <password>  <ms-email> --headless
 ```
 
 ### Example
