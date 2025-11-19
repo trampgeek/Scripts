@@ -9,9 +9,11 @@ Usage:
     python moodle_video_link_enhancer.py <quiz_url> <username> <password> <ms_full_email>
 
 Optional additional parameters:
-    --thumbnail-width  Width in pixels of the inserted thumbnails
+    --thumbnail-width  Width in pixels of the inserted thumbnails (default 400)
     --question-name    Name of a specific single question to process
     --headless         Run in a headless browser
+    --other-ids        Comma-separated list of additional quiz IDs to process
+                       (e.g., "138,139,140")
 """
 
 import argparse
@@ -41,7 +43,14 @@ class QuizVideoLinkEnhancer():
         self.page = None
 
 
-    def enhance_all_video_links(self):
+    def enhance_all_video_links(self, quiz_urls):
+        """
+        Process multiple quizzes in a single browser session.
+        This allows MFA to be completed once and reused across all quizzes.
+
+        Args:
+            quiz_urls: List of quiz URLs to process
+        """
         with sync_playwright() as p:
                 # Launch browser - use Chrome channel for better SharePoint/Stream support
                 # Chromium often has issues with Microsoft video DRM and codecs
@@ -55,26 +64,46 @@ class QuizVideoLinkEnhancer():
                 except Exception as e:
                     print(f"Could not launch Chrome: {e}\nAborting.")
                     sys.exit(0)
-                
+
                 context = browser.new_context(
                     viewport={'width': 1920, 'height': 1080}
                 )
                 self.page = context.new_page()
-                
+
                 try:
-                    self.process_quiz()
-                    
+                    # Process each quiz in sequence
+                    for i, quiz_url in enumerate(quiz_urls, 1):
+                        print("\n" + "="*70)
+                        print(f"PROCESSING QUIZ {i}/{len(quiz_urls)}")
+                        print(f"URL: {quiz_url}")
+                        print("="*70)
+
+                        # Update the quiz URL for this iteration
+                        self.quiz_url = quiz_url
+
+                        try:
+                            self.process_quiz()
+                        except Exception as e:
+                            print(f"\nError processing quiz {quiz_url}: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            print("\nContinuing with next quiz...")
+
+                    print("\n" + "="*70)
+                    print(f"ALL QUIZZES COMPLETE: Processed {len(quiz_urls)} quiz(zes)")
+                    print("="*70)
+
                 except Exception as e:
                     print(f"\nFatal error: {e}")
                     import traceback
                     traceback.print_exc()
-                    
+
                 finally:
                     # Keep browser open for a moment to see results
                     if not self.headless:
                         print("\nPress Enter to close browser...")
                         input()
-                    
+
                     browser.close()
 
     def login_to_moodle(self, page: Page):
@@ -156,10 +185,8 @@ class QuizVideoLinkEnhancer():
             print(f"Question {i}/{len(questions)}")
             print(f"{'='*60}")
 
-            is_first_question = (i == 1)
-
             try:
-                was_modified = self.process_question(question, is_first_question)
+                was_modified = self.process_question(question)
                 if was_modified:
                     modified_questions += 1
             except Exception as e:
@@ -278,40 +305,61 @@ class QuizVideoLinkEnhancer():
                 seen_urls.add(href)
                 urls_in_order.append(href)
 
-        print(f"  Found {len(urls_in_order)} unique video link(s)")
+        print(f"  Found {len(urls_in_order)} unique link(s)")
         return urls_in_order
 
 
-    def download_video_thumbnail(self, video_url: str, first_video: bool = False) -> Path:
+    def download_video_thumbnail(self, video_url: str) -> tuple[Path, str]:
         """
-        Navigate to the video URL, extract thumbnail, and save it.
-        Returns the path to the saved thumbnail.
+        Navigate to the video URL, extract thumbnail and video length, and save thumbnail.
+
+        Returns:
+            tuple: (thumbnail_path, video_length) where video_length is a string like "9:30"
+                   or None if length couldn't be extracted
         """
         print(f"  Processing link: {video_url}")
-        
+
         # Open video URL in new tab
         context = self.page.context
         video_page = context.new_page()
-        
+
         try:
             # Use 'load' instead of 'networkidle' for SharePoint/Stream pages
             # These pages have constant network activity (video streams, analytics, etc.)
             video_page.goto(video_url, wait_until='load', timeout=30000)
 
-            # Brief wait for potential redirects to SharePoint
+            # Brief wait for potential redirects to SharePoint/Microsoft login
             time.sleep(1)
-            
-            # Handle Microsoft authentication if this is the first URL.
-            if first_video:
-                self.do_ms_authentication(video_page)
-            
-            # Check if this is actually a video link (must contain 'stream.aspx')
+
+            # Check if we've been redirected to Microsoft login page
             current_url = video_page.url
+            if 'login.microsoftonline.com' in current_url or 'login.windows.net' in current_url:
+                print("  Detected Microsoft login page, authenticating...")
+                self.do_ms_authentication(video_page)
+                # Update current URL after authentication
+                current_url = video_page.url
+
+            # Check if this is actually a video link (must contain 'stream.aspx')
             if 'stream.aspx' not in current_url:
                 print(f"  Skipping - not a video link (URL: {current_url})")
                 raise NotAVideo(f"Not a video link - URL does not contain 'stream.aspx': {current_url}")
 
             print("  Confirmed video link (stream.aspx found)")
+
+            # Extract video length by clicking Trim icon
+            print("  Extracting video length...")
+            video_length = None
+            try:
+                # Click the Trim icon
+                video_page.locator('i[data-icon-name="Cut"]').click()
+
+                # Extract the video length from the "Video end" input field
+                video_end_input = video_page.locator('input.fui-SpinButton__input').last
+                video_length = video_end_input.get_attribute('value')
+                print(f"  Video length: {video_length}")
+            except Exception as e:
+                print(f"  Could not extract video length: {e}")
+                print("  Continuing without video length overlay...")
 
             # Wait for and click Video settings button
             print("  Opening Video settings panel...")
@@ -362,15 +410,15 @@ class QuizVideoLinkEnhancer():
                 f.write(base64.b64decode(image_data))
 
             print(f"  Saved full-resolution thumbnail to {thumbnail_path}")
-            return thumbnail_path
-            
+            return thumbnail_path, video_length
+
         finally:
             video_page.close()
 
 
     def do_ms_authentication(self, video_page):
-        """Grind through the MS authentication process, including the MFA step,
-           when processing the first question.
+        """Grind through the MS authentication process, including the MFA step.
+           Called automatically when a Microsoft login page is detected.
         """
         print("  Handling Microsoft authentication...")
         
@@ -388,10 +436,28 @@ class QuizVideoLinkEnhancer():
                 password_input = video_page.locator('input[type="password"], input[name="passwd"]')
                 password_input.fill(self.password)
                 video_page.click('input[type="submit"], button[type="submit"]')
-                
+
                 # Handle MFA - wait for user to approve
                 print("\n" + "="*60)
                 print("  MFA REQUIRED: Please approve the sign-in on your device")
+
+                # Check if there's an approval number to display
+                # Wait a moment for the MFA page to load
+                time.sleep(2)
+
+                try:
+                    # Check if the approval number is displayed
+                    approval_number_elem = video_page.locator('#idRichContext_DisplaySign')
+                    if approval_number_elem.count() > 0:
+                        approval_number = approval_number_elem.inner_text()
+                        print("="*60)
+                        print(f"  ** APPROVAL NUMBER: {approval_number} **")
+                        print(f"  Enter this number on your phone/device")
+                        print("="*60)
+                except Exception:
+                    # If we can't find the approval number, just continue
+                    pass
+
                 print("  Waiting for MFA approval and 'Stay signed in?' prompt...")
                 print("="*60)
 
@@ -415,13 +481,18 @@ class QuizVideoLinkEnhancer():
                 print("  Attempting to continue...")
 
 
-    def add_thumbnail_after_link(self, video_url: str, thumbnail_path: Path):
-        """Insert a clickable thumbnail following the period at the end of the 
+    def add_thumbnail_after_link(self, video_url: str, thumbnail_path: Path, video_length: str = None):
+        """Insert a clickable thumbnail following the period at the end of the
            sentence containing the given video_url.
            This is a bit tricky. We first insert the image at the end of the
            question text using the TinyMCE "Insert image" toolbar function,
            then switch to using the TinyMCE edit API to move the image to
            the right place and wrap it in an <a> element.
+
+           Args:
+               video_url: The URL of the video
+               thumbnail_path: Path to the thumbnail image file
+               video_length: Duration string like "9:30" (optional)
         """
         
         # Get the editor iframe (NB: assuming use of TinyMCE editor).
@@ -477,7 +548,7 @@ class QuizVideoLinkEnhancer():
 
 
         # Now we need to make the image clickable by wrapping it in a link
-        self.move_image_and_wrap_in_link(video_url, thumbnail_path)
+        self.move_image_and_wrap_in_link(video_url, thumbnail_path, video_length)
 
 
     def set_image_details_and_save(self, link_text):
@@ -537,12 +608,17 @@ class QuizVideoLinkEnhancer():
             print("  Warning: Could not find Save button")
 
 
-    def move_image_and_wrap_in_link(self, video_url: str, thumbnail_path: Path):
+    def move_image_and_wrap_in_link(self, video_url: str, thumbnail_path: Path, video_length: str = None):
         """Use the TinyMCE edit API to edit the question text.
            Remove any existing thumbnails with the given video_url.
            Then locate the thumbnail we just added, wrap it in an <a> link,
            and insert it after the first period following the first occurrence
            of the video url.
+
+           Args:
+               video_url: The URL of the video
+               thumbnail_path: Path to the thumbnail image file
+               video_length: Duration string like "9:30" (optional)
         """
         print("  Using TinyMCE API to wrap image with link...")
 
@@ -597,9 +673,15 @@ class QuizVideoLinkEnhancer():
             # Remove the image from its current location
             html_content = html_content[:img_match.start()] + html_content[img_match.end():]
 
-            # Step 3: Wrap it into an <a> element with play icon overlay
+            # Step 3: Wrap it into an <a> element with play icon and duration overlays
             play_icon = '<img src="data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 64 64\'%3E%3Ccircle cx=\'32\' cy=\'32\' r=\'32\' fill=\'rgba(0,0,0,0.6)\'/%3E%3Cpath d=\'M 26 20 L 26 44 L 44 32 Z\' fill=\'white\'/%3E%3C/svg%3E" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:64px;height:64px;pointer-events:none;" alt="">'
-            wrapped_img = f'<br><a href="{video_url}" target="_blank" rel="noopener" style="text-decoration:none;"><span style="position:relative;display:inline-block;">{img_tag}{play_icon}</span></a><br>'
+
+            # Add duration overlay if video length is available
+            duration_overlay = ''
+            if video_length:
+                duration_overlay = f'<span style="position:absolute;bottom:3px;right:3px;background-color:white;border:1px solid darkgray; color:black;padding:2px 6px;font-size:10pt;font-family:Arial,sans-serif;font-style:normal;pointer-events:none;">{video_length}</span>'
+
+            wrapped_img = f'<br><a href="{video_url}" target="_blank" rel="noopener" style="text-decoration:none;"><span style="position:relative;display:inline-block;padding-top:10px">{img_tag}{play_icon}{duration_overlay}</span></a><br>'
 
             # Step 4: Insert after the first period following the first occurrence of video_url
             url_pos = html_content.find(video_url)
@@ -660,15 +742,15 @@ class QuizVideoLinkEnhancer():
         # Scroll to bottom to ensure Cancel button is visible
         self.page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
 
-        # Click Cancel button
-        self.page.click('a:has-text("Cancel"), button:has-text("Cancel")')
+        # Click Cancel button (which is actually an input element of type submit)
+        self.page.click('input[type="submit"][name="cancel"]')
 
         # Wait for navigation to complete
         self.page.wait_for_load_state('networkidle')
         print("  Edit cancelled successfully!")
 
 
-    def process_question(self, question_element, is_first_question: bool = False):
+    def process_question(self, question_element):
         """Process a single description question.
         Returns True if changes were made and saved, False otherwise."""
         # Extract question name for logging
@@ -704,15 +786,12 @@ class QuizVideoLinkEnhancer():
         for i, video_url in enumerate(video_urls, 1):
             print(f"\n  Processing link {i}/{len(video_urls)}...")
 
-            # First video of first question needs MS auth
-            first_video = (is_first_question and i == 1)
-
             try:
-                # Download thumbnail
-                thumbnail_path = self.download_video_thumbnail(video_url, first_video)
+                # Download thumbnail and get video length (MS auth handled automatically if needed)
+                thumbnail_path, video_length = self.download_video_thumbnail(video_url)
 
                 # Add the thumbnail at the end of the sentence containing the video URL.
-                self.add_thumbnail_after_link(video_url, thumbnail_path)
+                self.add_thumbnail_after_link(video_url, thumbnail_path, video_length)
 
                 # Mark that we successfully made a change
                 changes_made = True
@@ -734,6 +813,21 @@ class QuizVideoLinkEnhancer():
             return False
 
 
+def replace_quiz_id_in_url(original_url: str, new_id: str) -> str:
+    """
+    Replace the quiz ID in a Moodle quiz URL.
+    Assumes URL ends with ?id=NUMBER format.
+
+    Args:
+        original_url: The original quiz URL (e.g., https://...?id=137)
+        new_id: The new quiz ID to use
+
+    Returns:
+        The modified URL with the new quiz ID
+    """
+    return re.sub(r'\?id=\d+', f'?id={new_id}', original_url)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Replace video links with thumbnails in Moodle quiz questions'
@@ -742,27 +836,41 @@ def main():
     parser.add_argument('username', help='Moodle username')
     parser.add_argument('password', help='Moodle password')
     parser.add_argument('ms_email', help='Full email for Microsoft authentication')
-    parser.add_argument('--thumbnail-width', type=int, default=350,
-                        help='Width of thumbnail images in pixels (default: 350)')
+    parser.add_argument('--thumbnail-width', type=int, default=400,
+                        help='Width of thumbnail images in pixels (default: 400)')
     parser.add_argument('--question-name', type=str, default=None,
                         help='Process only the question with this name (default: process all questions)')
     parser.add_argument('--headless', action='store_true',
                         help='Run browser in headless mode (default: visible)')
+    parser.add_argument('--other-ids', type=str, default=None,
+                        help='Comma-separated list of additional quiz IDs to process after the main quiz (e.g., "138,139,140")')
 
     args = parser.parse_args()
-    
+
     # Create temporary directory for thumbnails
     temp_dir = Path('/tmp/moodle_thumbnails')
     temp_dir.mkdir(exist_ok=True)
-    
+
+    # Build list of quiz URLs to process
+    quiz_urls = [args.quiz_url]
+
+    if args.other_ids:
+        # Parse comma-separated list of IDs and create URLs
+        other_ids = [id.strip() for id in args.other_ids.split(',')]
+        for quiz_id in other_ids:
+            quiz_url = replace_quiz_id_in_url(args.quiz_url, quiz_id)
+            quiz_urls.append(quiz_url)
+
     print("Starting Moodle Video Thumbnail Replacer...")
-    print(f"Quiz URL: {args.quiz_url}")
+    print(f"Quiz URL(s): {len(quiz_urls)} quiz(zes) to process")
+    for i, url in enumerate(quiz_urls, 1):
+        print(f"  {i}. {url}")
     print(f"Username: {args.username}")
     print(f"Temporary directory: {temp_dir}")
     print()
-    
+
     replacer = QuizVideoLinkEnhancer(args, temp_dir)
-    replacer.enhance_all_video_links()
+    replacer.enhance_all_video_links(quiz_urls)
 
 
 if __name__ == '__main__':
